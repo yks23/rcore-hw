@@ -14,7 +14,9 @@ mod switch;
 #[allow(clippy::module_inception)]
 mod task;
 
+use crate::config::MAX_SYSCALL_NUM;
 use crate::loader::{get_app_data, get_num_app};
+use crate::mm::{MapPermission, VirtAddr};
 use crate::sync::UPSafeCell;
 use crate::trap::TrapContext;
 use alloc::vec::Vec;
@@ -153,6 +155,32 @@ impl TaskManager {
             panic!("All applications completed!");
         }
     }
+}
+
+pub fn inc_syscall_count(id: usize) {
+    let mut inner = TASK_MANAGER.inner.exclusive_access();
+    let cur = inner.current_task;
+    if id < MAX_SYSCALL_NUM {
+        inner.tasks[cur].syscall_counts[id] += 1;
+    }
+}
+
+pub fn get_syscall_count(id: usize) -> u32 {
+    let inner = TASK_MANAGER.inner.exclusive_access();
+    let cur = inner.current_task;
+    if id < MAX_SYSCALL_NUM { inner.tasks[cur].syscall_counts[id] } else { 0 }
+}
+
+pub fn current_mmap(start: usize, len: usize, perm: MapPermission) -> isize {
+    let mut inner = TASK_MANAGER.inner.exclusive_access();
+    let cur = inner.current_task;
+    inner.tasks[cur].memory_set.mmap(VirtAddr::from(start), VirtAddr::from(start + len), perm)
+}
+
+pub fn current_munmap(start: usize, len: usize) -> isize {
+    let mut inner = TASK_MANAGER.inner.exclusive_access();
+    let cur = inner.current_task;
+    inner.tasks[cur].memory_set.munmap(VirtAddr::from(start), VirtAddr::from(start + len))
 }
 
 /// Run the first task in task list.
