@@ -1,0 +1,6 @@
+[submodule "test"]
+	path = test
+	url = git@git.tsinghua.edu.cn:os-lab/2025s/public/rcore-tutorial-test-2025S.git
+[submodule "code"]
+	path = code
+	url = git@git.tsinghua.edu.cn:os-lab/2025s/public/rcore-tutorial-code-2025S.git
