@@ -271,6 +271,40 @@ impl MemorySet {
         self.areas.clear();
     }
 
+    pub fn mmap(&mut self, start_va: VirtAddr, end_va: VirtAddr, perm: MapPermission) -> isize {
+        let s = start_va.floor();
+        let e = end_va.ceil();
+        for vpn in VPNRange::new(s, e) {
+            if let Some(pte) = self.page_table.translate(vpn) {
+                if pte.is_valid() { return -1; }
+            }
+        }
+        self.insert_framed_area(start_va, end_va, perm);
+        0
+    }
+
+    pub fn munmap(&mut self, start_va: VirtAddr, end_va: VirtAddr) -> isize {
+        let s = start_va.floor();
+        let e = end_va.ceil();
+        for vpn in VPNRange::new(s, e) {
+            match self.page_table.translate(vpn) {
+                Some(pte) if pte.is_valid() => {}
+                _ => return -1,
+            }
+        }
+        if let Some(idx) = self.areas.iter().position(|a| {
+            a.vpn_range.get_start() == s && a.vpn_range.get_end() == e
+        }) {
+            self.areas[idx].unmap(&mut self.page_table);
+            self.areas.remove(idx);
+            0
+        } else {
+            for vpn in VPNRange::new(s, e) { self.page_table.unmap(vpn); }
+            self.areas.retain(|a| !(a.vpn_range.get_start() >= s && a.vpn_range.get_end() <= e));
+            0
+        }
+    }
+
     /// shrink the area to new_end
     #[allow(unused)]
     pub fn shrink_to(&mut self, start: VirtAddr, new_end: VirtAddr) -> bool {
