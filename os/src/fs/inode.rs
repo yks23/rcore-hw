@@ -37,6 +37,10 @@ impl OSInode {
             inner: unsafe { UPSafeCell::new(OSInodeInner { offset: 0, inode }) },
         }
     }
+    pub fn get_inode(&self) -> Arc<Inode> {
+        self.inner.exclusive_access().inode.clone()
+    }
+
     /// read all data from the inode
     pub fn read_all(&self) -> Vec<u8> {
         let mut inner = self.inner.exclusive_access();
@@ -131,6 +135,9 @@ impl File for OSInode {
     }
     fn writable(&self) -> bool {
         self.writable
+    }
+    fn get_inode(&self) -> Option<Arc<Inode>> {
+        Some(self.inner.exclusive_access().inode.clone())
     }
     fn read(&self, mut buf: UserBuffer) -> usize {
         let mut inner = self.inner.exclusive_access();
