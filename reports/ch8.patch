@@ -1,8 +1,8 @@
 diff --git a/os/src/syscall/process.rs b/os/src/syscall/process.rs
-index 01c5499..2324dd9 100644
+index 01c5499..4aab131 100644
 --- a/os/src/syscall/process.rs
 +++ b/os/src/syscall/process.rs
-@@ -151,12 +151,23 @@ pub fn sys_kill(pid: usize, signal: u32) -> isize {
+@@ -151,12 +151,15 @@ pub fn sys_kill(pid: usize, signal: u32) -> isize {
  /// YOUR JOB: get time with second and microsecond
  /// HINT: You might reimplement it with virtual memory management.
  /// HINT: What if [`TimeVal`] is splitted by two pages ?
@@ -17,289 +17,119 @@ index 01c5499..2324dd9 100644
 +pub fn sys_get_time(ts: *mut TimeVal, _tz: usize) -> isize {
 +    let us = crate::timer::get_time_us();
 +    let token = current_user_token();
-+    let va = crate::mm::VirtAddr::from(ts as usize);
-+    let vpn = va.floor();
-+    let pt = crate::mm::PageTable::from_token(token);
-+    if let Some(pte) = pt.translate(vpn) {
-+        let pa = crate::mm::PhysAddr::from(pte.ppn()).0 + va.page_offset();
-+        let tv = unsafe { &mut *(pa as *mut TimeVal) };
-+        tv.sec = us / 1_000_000;
-+        tv.usec = us % 1_000_000;
-+        0
-+    } else {
-+        -1
-+    }
++    let tv = translated_refmut(token, ts);
++    tv.sec = us / 1_000_000;
++    tv.usec = us % 1_000_000;
++    0
  }
  
  /// mmap syscall
 diff --git a/os/src/syscall/sync.rs b/os/src/syscall/sync.rs
-index 290ee6f..5d50ded 100644
+index bd3e5e3..d1c538d 100644
 --- a/os/src/syscall/sync.rs
 +++ b/os/src/syscall/sync.rs
-@@ -2,6 +2,8 @@ use crate::sync::{Condvar, Mutex, MutexBlocking, MutexSpin, Semaphore};
- use crate::task::{block_current_and_run_next, current_process, current_task};
- use crate::timer::{add_timer, get_time_ms};
- use alloc::sync::Arc;
-+use alloc::vec;
-+use alloc::vec::Vec;
- /// sleep syscall
- pub fn sys_sleep(ms: usize) -> isize {
-     trace!(
-@@ -57,40 +59,44 @@ pub fn sys_mutex_create(blocking: bool) -> isize {
- }
- /// mutex lock syscall
- pub fn sys_mutex_lock(mutex_id: usize) -> isize {
--    trace!(
--        "kernel:pid[{}] tid[{}] sys_mutex_lock",
--        current_task().unwrap().process.upgrade().unwrap().getpid(),
--        current_task()
--            .unwrap()
--            .inner_exclusive_access()
--            .res
--            .as_ref()
--            .unwrap()
--            .tid
--    );
-+    let tid = current_task()
-+        .unwrap()
-+        .inner_exclusive_access()
-+        .res
-+        .as_ref()
-+        .unwrap()
-+        .tid;
-     let process = current_process();
--    let process_inner = process.inner_exclusive_access();
-+    let mut process_inner = process.inner_exclusive_access();
-+    // Ensure mutex_holders is big enough
-+    while process_inner.mutex_holders.len() <= mutex_id {
-+        process_inner.mutex_holders.push(usize::MAX);
-+    }
-+    // Deadlock detection: check if current thread already holds this mutex
-+    if process_inner.deadlock_detect && process_inner.mutex_holders[mutex_id] == tid {
-+        return -0xdead_isize;
-+    }
-     let mutex = Arc::clone(process_inner.mutex_list[mutex_id].as_ref().unwrap());
-     drop(process_inner);
-     drop(process);
-     mutex.lock();
-+    // Record holder after successful lock
-+    let process = current_process();
-+    let mut process_inner = process.inner_exclusive_access();
-+    while process_inner.mutex_holders.len() <= mutex_id {
-+        process_inner.mutex_holders.push(usize::MAX);
-+    }
-+    process_inner.mutex_holders[mutex_id] = tid;
-     0
- }
- /// mutex unlock syscall
- pub fn sys_mutex_unlock(mutex_id: usize) -> isize {
--    trace!(
--        "kernel:pid[{}] tid[{}] sys_mutex_unlock",
--        current_task().unwrap().process.upgrade().unwrap().getpid(),
--        current_task()
--            .unwrap()
--            .inner_exclusive_access()
--            .res
--            .as_ref()
--            .unwrap()
--            .tid
--    );
-     let process = current_process();
--    let process_inner = process.inner_exclusive_access();
-+    let mut process_inner = process.inner_exclusive_access();
-+    // Clear holder
-+    if mutex_id < process_inner.mutex_holders.len() {
-+        process_inner.mutex_holders[mutex_id] = usize::MAX;
-+    }
-     let mutex = Arc::clone(process_inner.mutex_list[mutex_id].as_ref().unwrap());
-     drop(process_inner);
-     drop(process);
-@@ -131,42 +137,146 @@ pub fn sys_semaphore_create(res_count: usize) -> isize {
- }
- /// semaphore up syscall
- pub fn sys_semaphore_up(sem_id: usize) -> isize {
--    trace!(
--        "kernel:pid[{}] tid[{}] sys_semaphore_up",
--        current_task().unwrap().process.upgrade().unwrap().getpid(),
--        current_task()
--            .unwrap()
--            .inner_exclusive_access()
--            .res
--            .as_ref()
--            .unwrap()
--            .tid
--    );
-+    let tid = current_task()
-+        .unwrap()
-+        .inner_exclusive_access()
-+        .res
-+        .as_ref()
-+        .unwrap()
-+        .tid;
-     let process = current_process();
--    let process_inner = process.inner_exclusive_access();
-+    let mut process_inner = process.inner_exclusive_access();
-+    // Update allocation tracking
-+    if tid < process_inner.sem_alloc.len() && sem_id < process_inner.sem_alloc[tid].len() {
-+        if process_inner.sem_alloc[tid][sem_id] > 0 {
-+            process_inner.sem_alloc[tid][sem_id] -= 1;
-+        }
-+    }
-     let sem = Arc::clone(process_inner.semaphore_list[sem_id].as_ref().unwrap());
-     drop(process_inner);
-     sem.up();
-     0
- }
-+/// Check for deadlock using wait-for graph cycle detection.
-+/// Thread `tid` wants to acquire sem `sem_id` and would block.
-+/// Check if this creates a circular wait.
-+fn detect_semaphore_deadlock(
+@@ -5,18 +5,50 @@ use alloc::sync::Arc;
+ use alloc::vec;
+ use alloc::vec::Vec;
+ 
++/// Check if ALL holders of resource `res_sem` are blocked (waiting for something).
++/// If any holder is free (not waiting and not the requesting thread), return false.
++fn all_holders_blocked(
 +    sem_alloc: &[Vec<usize>],
 +    sem_waiting: &[Option<usize>],
++    res_sem: usize,
 +    tid: usize,
-+    sem_id: usize,
 +) -> bool {
-+    let n_threads = sem_alloc.len().max(sem_waiting.len()).max(tid + 1);
-+    let mut visited = vec![false; n_threads];
-+    let mut stack = Vec::new();
-+    // tid is waiting for sem_id
-+    // Find all holders of sem_id
-+    visited[tid] = true;
-+    for t in 0..n_threads {
-+        if t < sem_alloc.len()
-+            && sem_id < sem_alloc[t].len()
-+            && sem_alloc[t][sem_id] > 0
-+            && t != tid
-+        {
-+            stack.push(t);
-+        }
-+    }
-+    // BFS/DFS through the wait-for graph
-+    while let Some(holder) = stack.pop() {
-+        if holder == tid {
-+            return true; // Cycle found
-+        }
-+        if holder >= n_threads || visited[holder] {
++    let num_threads = sem_alloc.len();
++    for t in 0..num_threads {
++        if t == tid {
 +            continue;
 +        }
-+        visited[holder] = true;
-+        // What is this holder waiting for?
-+        let waiting = if holder < sem_waiting.len() {
++        if res_sem < sem_alloc[t].len() && sem_alloc[t][res_sem] > 0 {
++            let waiting = if t < sem_waiting.len() {
++                sem_waiting[t]
++            } else {
++                None
++            };
++            if waiting.is_none() {
++                return false;
++            }
++        }
++    }
++    true
++}
++
++/// Detect deadlock using wait-for graph with DFS.
++/// Only considers a cycle as deadlock if all holders along the path are blocked.
+ fn detect_semaphore_deadlock(
+     sem_alloc: &[Vec<usize>],
+     sem_waiting: &[Option<usize>],
+     tid: usize,
+     sem_id: usize,
+ ) -> bool {
+-    let num_threads = sem_alloc.len();
++    if !all_holders_blocked(sem_alloc, sem_waiting, sem_id, tid) {
++        return false;
++    }
++    let num_threads = sem_alloc.len().max(if tid < sem_waiting.len() { sem_waiting.len() } else { tid + 1 });
+     let mut visited = vec![false; num_threads];
+     visited[tid] = true;
+     let mut stack: Vec<usize> = Vec::new();
+-    for t in 0..num_threads {
+-        if sem_id < sem_alloc[t].len() && sem_alloc[t][sem_id] > 0 {
++    for t in 0..sem_alloc.len() {
++        if sem_id < sem_alloc[t].len() && sem_alloc[t][sem_id] > 0 && t != tid {
+             stack.push(t);
+         }
+     }
+@@ -24,17 +56,25 @@ fn detect_semaphore_deadlock(
+         if holder == tid {
+             return true;
+         }
+-        if visited[holder] {
++        if holder >= num_threads || visited[holder] {
+             continue;
+         }
+         visited[holder] = true;
+-        if let Some(wait_sem) = sem_waiting[holder] {
+-            for t in 0..num_threads {
+-                if wait_sem < sem_alloc[t].len() && sem_alloc[t][wait_sem] > 0 {
++        let wait_sem = if holder < sem_waiting.len() {
 +            sem_waiting[holder]
 +        } else {
 +            None
 +        };
-+        if let Some(wanted_sem) = waiting {
-+            // This holder is blocked on wanted_sem
-+            // Find who holds wanted_sem
-+            for t in 0..n_threads {
-+                if t < sem_alloc.len()
-+                    && wanted_sem < sem_alloc[t].len()
-+                    && sem_alloc[t][wanted_sem] > 0
-+                    && !visited[t]
-+                {
-+                    stack.push(t);
-+                }
++        if let Some(ws) = wait_sem {
++            if !all_holders_blocked(sem_alloc, sem_waiting, ws, tid) {
++                continue;
 +            }
-+        }
-+        // If holder is NOT waiting, it can eventually release, no cycle through it
-+    }
-+    false
-+}
-+
- /// semaphore down syscall
- pub fn sys_semaphore_down(sem_id: usize) -> isize {
--    trace!(
--        "kernel:pid[{}] tid[{}] sys_semaphore_down",
--        current_task().unwrap().process.upgrade().unwrap().getpid(),
--        current_task()
--            .unwrap()
--            .inner_exclusive_access()
--            .res
--            .as_ref()
--            .unwrap()
--            .tid
--    );
-+    let tid = current_task()
-+        .unwrap()
-+        .inner_exclusive_access()
-+        .res
-+        .as_ref()
-+        .unwrap()
-+        .tid;
-     let process = current_process();
--    let process_inner = process.inner_exclusive_access();
-+    let mut process_inner = process.inner_exclusive_access();
-+    let dd = process_inner.deadlock_detect;
-+    if dd {
-+        let sem_count = process_inner.semaphore_list.len();
-+        let mut available: Vec<isize> = Vec::with_capacity(sem_count);
-+        for i in 0..sem_count {
-+            if let Some(sem) = &process_inner.semaphore_list[i] {
-+                available.push(sem.inner.exclusive_access().count);
-+            } else {
-+                available.push(0);
-+            }
-+        }
-+        while process_inner.sem_alloc.len() <= tid {
-+            process_inner.sem_alloc.push(Vec::new());
-+        }
-+        while process_inner.sem_waiting.len() <= tid {
-+            process_inner.sem_waiting.push(None);
-+        }
-+        let avail = if sem_id < available.len() {
-+            available[sem_id]
-+        } else {
-+            1
-+        };
-+        if avail <= 0 {
-+            if detect_semaphore_deadlock(
-+                &process_inner.sem_alloc,
-+                &process_inner.sem_waiting,
-+                tid,
-+                sem_id,
-+            ) {
-+                return -0xdead_isize;
-+            }
-+            process_inner.sem_waiting[tid] = Some(sem_id);
-+        }
-+    }
-     let sem = Arc::clone(process_inner.semaphore_list[sem_id].as_ref().unwrap());
-     drop(process_inner);
-+    drop(process);
-     sem.down();
-+    if dd {
-+        let process2 = current_process();
-+        let mut pi = process2.inner_exclusive_access();
-+        while pi.sem_alloc.len() <= tid {
-+            pi.sem_alloc.push(Vec::new());
-+        }
-+        while pi.sem_alloc[tid].len() <= sem_id {
-+            pi.sem_alloc[tid].push(0);
-+        }
-+        pi.sem_alloc[tid][sem_id] += 1;
-+        if tid < pi.sem_waiting.len() {
-+            pi.sem_waiting[tid] = None;
-+        }
-+    }
-     0
- }
- /// condvar create syscall
-@@ -243,9 +353,9 @@ pub fn sys_condvar_wait(condvar_id: usize, mutex_id: usize) -> isize {
-     0
- }
- /// enable deadlock detection syscall
--///
--/// YOUR JOB: Implement deadlock detection, but might not all in this syscall
--pub fn sys_enable_deadlock_detect(_enabled: usize) -> isize {
--    trace!("kernel: sys_enable_deadlock_detect NOT IMPLEMENTED");
--    -1
-+pub fn sys_enable_deadlock_detect(enabled: usize) -> isize {
-+    let process = current_process();
-+    let mut process_inner = process.inner_exclusive_access();
-+    process_inner.deadlock_detect = enabled != 0;
-+    0
- }
++            for t in 0..sem_alloc.len() {
++                if ws < sem_alloc[t].len() && sem_alloc[t][ws] > 0 {
+                     if t == tid {
+                         return true;
+                     }
+-                    if !visited[t] {
++                    if t < num_threads && !visited[t] {
+                         stack.push(t);
+                     }
+                 }
+diff --git a/os/src/task/mod.rs b/os/src/task/mod.rs
+index 81a25be..9d8b3b7 100644
+--- a/os/src/task/mod.rs
++++ b/os/src/task/mod.rs
+@@ -41,8 +41,10 @@ pub use task::{TaskControlBlock, TaskStatus};
+ 
+ /// Make current task suspended and switch to the next task
+ pub fn suspend_current_and_run_next() {
+-    // There must be an application running.
+-    let task = take_current_task().unwrap();
++    let task = match take_current_task() {
++        Some(t) => t,
++        None => return,
++    };
+ 
+     // ---- access current TCB exclusively
+     let mut task_inner = task.inner_exclusive_access();
 diff --git a/os/src/task/process.rs b/os/src/task/process.rs
 index c2be1ce..2e21917 100644
 --- a/os/src/task/process.rs
@@ -341,3 +171,50 @@ index c2be1ce..2e21917 100644
                  })
              },
          });
+diff --git a/os/src/task/processor.rs b/os/src/task/processor.rs
+index b54f9c2..0fca1b6 100644
+--- a/os/src/task/processor.rs
++++ b/os/src/task/processor.rs
+@@ -52,6 +52,7 @@ lazy_static! {
+ ///Loop `fetch_task` to get the process that needs to run, and switch the process through `__switch`
+ pub fn run_tasks() {
+     loop {
++        crate::timer::check_timer_no_trace();
+         let mut processor = PROCESSOR.exclusive_access();
+         if let Some(task) = fetch_task() {
+             let idle_task_cx_ptr = processor.get_idle_task_cx_ptr();
+@@ -69,7 +70,8 @@ pub fn run_tasks() {
+                 __switch(idle_task_cx_ptr, next_task_cx_ptr);
+             }
+         } else {
+-            warn!("no tasks available in run_tasks");
++            drop(processor);
++            crate::timer::check_timer_no_trace();
+         }
+     }
+ }
+diff --git a/os/src/timer.rs b/os/src/timer.rs
+index 6c1df2b..302d86c 100644
+--- a/os/src/timer.rs
++++ b/os/src/timer.rs
+@@ -98,6 +98,20 @@ pub fn remove_timer(task: Arc<TaskControlBlock>) {
+     trace!("kernel: remove_timer END");
+ }
+ 
++/// Check timers without requiring a current task (safe for idle loop)
++pub fn check_timer_no_trace() {
++    let current_ms = get_time_ms();
++    let mut timers = TIMERS.exclusive_access();
++    while let Some(timer) = timers.peek() {
++        if timer.expire_ms <= current_ms {
++            wakeup_task(Arc::clone(&timer.task));
++            timers.pop();
++        } else {
++            break;
++        }
++    }
++}
++
+ /// Check if the timer has expired
+ pub fn check_timer() {
+     trace!(
