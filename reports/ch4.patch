@@ -1,0 +1,325 @@
+diff --git a/os/src/mm/memory_set.rs b/os/src/mm/memory_set.rs
+index 7a7b7ea..b53be65 100644
+--- a/os/src/mm/memory_set.rs
++++ b/os/src/mm/memory_set.rs
+@@ -248,6 +248,48 @@ impl MemorySet {
+         }
+     }
+ 
++    /// Map a new framed area [start_va, start_va+len). Returns 0 on success, -1 on failure.
++    pub fn mmap(&mut self, start_va: VirtAddr, end_va: VirtAddr, permission: MapPermission) -> isize {
++        let start_vpn = start_va.floor();
++        let end_vpn = end_va.ceil();
++        for vpn in VPNRange::new(start_vpn, end_vpn) {
++            if let Some(pte) = self.page_table.translate(vpn) {
++                if pte.is_valid() {
++                    return -1;
++                }
++            }
++        }
++        self.insert_framed_area(start_va, end_va, permission);
++        0
++    }
++
++    /// Unmap the area covering [start_va, start_va+len). Returns 0 on success, -1 on failure.
++    pub fn munmap(&mut self, start_va: VirtAddr, end_va: VirtAddr) -> isize {
++        let start_vpn = start_va.floor();
++        let end_vpn = end_va.ceil();
++        for vpn in VPNRange::new(start_vpn, end_vpn) {
++            match self.page_table.translate(vpn) {
++                Some(pte) if pte.is_valid() => {}
++                _ => return -1,
++            }
++        }
++        if let Some(idx) = self.areas.iter().position(|area| {
++            area.vpn_range.get_start() == start_vpn && area.vpn_range.get_end() == end_vpn
++        }) {
++            self.areas[idx].unmap(&mut self.page_table);
++            self.areas.remove(idx);
++            0
++        } else {
++            for vpn in VPNRange::new(start_vpn, end_vpn) {
++                self.page_table.unmap(vpn);
++            }
++            self.areas.retain(|area| {
++                !(area.vpn_range.get_start() >= start_vpn && area.vpn_range.get_end() <= end_vpn)
++            });
++            0
++        }
++    }
++
+     /// append the area to new_end
+     #[allow(unused)]
+     pub fn append_to(&mut self, start: VirtAddr, new_end: VirtAddr) -> bool {
+diff --git a/os/src/syscall/mod.rs b/os/src/syscall/mod.rs
+index 91d7ba3..03da33a 100644
+--- a/os/src/syscall/mod.rs
++++ b/os/src/syscall/mod.rs
+@@ -31,8 +31,11 @@ mod process;
+ use fs::*;
+ use process::*;
+ 
++use crate::task::inc_syscall_count;
++
+ /// handle syscall exception with `syscall_id` and other arguments
+ pub fn syscall(syscall_id: usize, args: [usize; 3]) -> isize {
++    inc_syscall_count(syscall_id);
+     match syscall_id {
+         SYSCALL_WRITE => sys_write(args[0], args[1] as *const u8, args[2]),
+         SYSCALL_EXIT => sys_exit(args[0] as i32),
+diff --git a/os/src/syscall/process.rs b/os/src/syscall/process.rs
+index ec4285b..7a43ca4 100644
+--- a/os/src/syscall/process.rs
++++ b/os/src/syscall/process.rs
+@@ -1,10 +1,21 @@
+ //! Process management syscalls
+-use crate::task::{change_program_brk, exit_current_and_run_next, suspend_current_and_run_next};
++use crate::{
++    config::PAGE_SIZE,
++    mm::{translated_byte_buffer, MapPermission},
++    task::{
++        change_program_brk, current_mmap, current_munmap, current_user_token,
++        exit_current_and_run_next, get_syscall_count, suspend_current_and_run_next,
++    },
++    timer::get_time_us,
++};
+ 
+ #[repr(C)]
+ #[derive(Debug)]
++/// TimeVal struct for sys_get_time
+ pub struct TimeVal {
++    /// seconds
+     pub sec: usize,
++    /// microseconds
+     pub usec: usize,
+ }
+ 
+@@ -22,32 +33,121 @@ pub fn sys_yield() -> isize {
+     0
+ }
+ 
+-/// YOUR JOB: get time with second and microsecond
+-/// HINT: You might reimplement it with virtual memory management.
+-/// HINT: What if [`TimeVal`] is splitted by two pages ?
+-pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
++/// get time with second and microsecond (virtual memory aware)
++pub fn sys_get_time(ts: *mut TimeVal, _tz: usize) -> isize {
+     trace!("kernel: sys_get_time");
+-    -1
++    let us = get_time_us();
++    let token = current_user_token();
++    let buffers = translated_byte_buffer(token, ts as *const u8, core::mem::size_of::<TimeVal>());
++    let time_val = TimeVal {
++        sec: us / 1_000_000,
++        usec: us % 1_000_000,
++    };
++    let src = unsafe {
++        core::slice::from_raw_parts(
++            &time_val as *const TimeVal as *const u8,
++            core::mem::size_of::<TimeVal>(),
++        )
++    };
++    let mut offset = 0;
++    for buf in buffers {
++        let copy_len = buf.len();
++        buf.copy_from_slice(&src[offset..offset + copy_len]);
++        offset += copy_len;
++    }
++    0
+ }
+ 
+-/// TODO: Finish sys_trace to pass testcases
+-/// HINT: You might reimplement it with virtual memory management.
+-pub fn sys_trace(_trace_request: usize, _id: usize, _data: usize) -> isize {
+-    trace!("kernel: sys_trace");
+-    -1
++/// Check if a user virtual address is readable (mapped, valid, and user-accessible).
++fn translate_user_va_readable(token: usize, va: usize) -> Option<usize> {
++    let page_table = crate::mm::PageTable::from_token(token);
++    let virt_addr = crate::mm::VirtAddr::from(va);
++    let vpn = virt_addr.floor();
++    match page_table.translate(vpn) {
++        Some(pte) if pte.is_valid() && (pte.flags() & crate::mm::PTEFlags::U) != crate::mm::PTEFlags::empty() => {
++            let pa: usize = crate::mm::PhysAddr::from(pte.ppn()).0 + virt_addr.page_offset();
++            Some(pa)
++        }
++        _ => None,
++    }
+ }
+ 
+-// YOUR JOB: Implement mmap.
+-pub fn sys_mmap(_start: usize, _len: usize, _port: usize) -> isize {
+-    trace!("kernel: sys_mmap NOT IMPLEMENTED YET!");
+-    -1
++/// Trace syscall: read/write user memory or count syscall invocations (virtual memory aware).
++pub fn sys_trace(trace_request: usize, id: usize, data: usize) -> isize {
++    match trace_request {
++        // Read
++        0 => {
++            let token = current_user_token();
++            match translate_user_va_readable(token, id) {
++                Some(pa) => unsafe { *(pa as *const u8) as isize },
++                None => -1,
++            }
++        }
++        // Write
++        1 => {
++            let token = current_user_token();
++            let page_table = crate::mm::PageTable::from_token(token);
++            let virt_addr = crate::mm::VirtAddr::from(id);
++            let vpn = virt_addr.floor();
++            match page_table.translate(vpn) {
++                Some(pte)
++                    if pte.is_valid()
++                        && pte.writable()
++                        && (pte.flags() & crate::mm::PTEFlags::U)
++                            != crate::mm::PTEFlags::empty() =>
++                {
++                    let pa: usize =
++                        crate::mm::PhysAddr::from(pte.ppn()).0 + virt_addr.page_offset();
++                    unsafe {
++                        *(pa as *mut u8) = data as u8;
++                    }
++                    0
++                }
++                _ => -1,
++            }
++        }
++        // Syscall count
++        2 => get_syscall_count(id) as isize,
++        _ => -1,
++    }
++}
++
++/// Implement mmap.
++pub fn sys_mmap(start: usize, len: usize, port: usize) -> isize {
++    trace!("kernel: sys_mmap");
++    if start % PAGE_SIZE != 0 {
++        return -1;
++    }
++    if len == 0 {
++        return -1;
++    }
++    if port & !0x7 != 0 || port == 0 {
++        return -1;
++    }
++    let mut perm = MapPermission::U;
++    if port & 1 != 0 {
++        perm |= MapPermission::R;
++    }
++    if port & 2 != 0 {
++        perm |= MapPermission::W;
++    }
++    if port & 4 != 0 {
++        perm |= MapPermission::X;
++    }
++    let aligned_len = (len + PAGE_SIZE - 1) / PAGE_SIZE * PAGE_SIZE;
++    current_mmap(start, aligned_len, perm)
+ }
+ 
+-// YOUR JOB: Implement munmap.
+-pub fn sys_munmap(_start: usize, _len: usize) -> isize {
+-    trace!("kernel: sys_munmap NOT IMPLEMENTED YET!");
+-    -1
++/// Implement munmap.
++pub fn sys_munmap(start: usize, len: usize) -> isize {
++    trace!("kernel: sys_munmap");
++    if start % PAGE_SIZE != 0 || len == 0 {
++        return -1;
++    }
++    let aligned_len = (len + PAGE_SIZE - 1) / PAGE_SIZE * PAGE_SIZE;
++    current_munmap(start, aligned_len)
+ }
++
+ /// change data segment size
+ pub fn sys_sbrk(size: i32) -> isize {
+     trace!("kernel: sys_sbrk");
+diff --git a/os/src/task/mod.rs b/os/src/task/mod.rs
+index a745df8..17a62f9 100644
+--- a/os/src/task/mod.rs
++++ b/os/src/task/mod.rs
+@@ -14,7 +14,9 @@ mod switch;
+ #[allow(clippy::module_inception)]
+ mod task;
+ 
++use crate::config::MAX_SYSCALL_NUM;
+ use crate::loader::{get_app_data, get_num_app};
++use crate::mm::{MapPermission, VirtAddr};
+ use crate::sync::UPSafeCell;
+ use crate::trap::TrapContext;
+ use alloc::vec::Vec;
+@@ -155,6 +157,44 @@ impl TaskManager {
+     }
+ }
+ 
++/// Increment the syscall count for the current task.
++pub fn inc_syscall_count(syscall_id: usize) {
++    let mut inner = TASK_MANAGER.inner.exclusive_access();
++    let cur = inner.current_task;
++    if syscall_id < MAX_SYSCALL_NUM {
++        inner.tasks[cur].syscall_counts[syscall_id] += 1;
++    }
++}
++
++/// Get the syscall count for the current task.
++pub fn get_syscall_count(syscall_id: usize) -> u32 {
++    let inner = TASK_MANAGER.inner.exclusive_access();
++    let cur = inner.current_task;
++    if syscall_id < MAX_SYSCALL_NUM {
++        inner.tasks[cur].syscall_counts[syscall_id]
++    } else {
++        0
++    }
++}
++
++/// Mmap for current task's memory set.
++pub fn current_mmap(start: usize, len: usize, perm: MapPermission) -> isize {
++    let mut inner = TASK_MANAGER.inner.exclusive_access();
++    let cur = inner.current_task;
++    let start_va = VirtAddr::from(start);
++    let end_va = VirtAddr::from(start + len);
++    inner.tasks[cur].memory_set.mmap(start_va, end_va, perm)
++}
++
++/// Munmap for current task's memory set.
++pub fn current_munmap(start: usize, len: usize) -> isize {
++    let mut inner = TASK_MANAGER.inner.exclusive_access();
++    let cur = inner.current_task;
++    let start_va = VirtAddr::from(start);
++    let end_va = VirtAddr::from(start + len);
++    inner.tasks[cur].memory_set.munmap(start_va, end_va)
++}
++
+ /// Run the first task in task list.
+ pub fn run_first_task() {
+     TASK_MANAGER.run_first_task();
+diff --git a/os/src/task/task.rs b/os/src/task/task.rs
+index dce6981..428d408 100644
+--- a/os/src/task/task.rs
++++ b/os/src/task/task.rs
+@@ -1,6 +1,6 @@
+ //! Types related to task management
+ use super::TaskContext;
+-use crate::config::TRAP_CONTEXT_BASE;
++use crate::config::{MAX_SYSCALL_NUM, TRAP_CONTEXT_BASE};
+ use crate::mm::{
+     kernel_stack_position, MapPermission, MemorySet, PhysPageNum, VirtAddr, KERNEL_SPACE,
+ };
+@@ -28,6 +28,9 @@ pub struct TaskControlBlock {
+ 
+     /// Program break
+     pub program_brk: usize,
++
++    /// Syscall invocation counts for this task
++    pub syscall_counts: [u32; MAX_SYSCALL_NUM],
+ }
+ 
+ impl TaskControlBlock {
+@@ -63,6 +66,7 @@ impl TaskControlBlock {
+             base_size: user_sp,
+             heap_bottom: user_sp,
+             program_brk: user_sp,
++            syscall_counts: [0; MAX_SYSCALL_NUM],
+         };
+         // prepare TrapContext in user space
+         let trap_cx = task_control_block.get_trap_cx();

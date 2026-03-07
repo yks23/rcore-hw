@@ -1,0 +1,162 @@
+diff --git a/os/src/config.rs b/os/src/config.rs
+index 89ed947..9995144 100644
+--- a/os/src/config.rs
++++ b/os/src/config.rs
+@@ -19,3 +19,6 @@ pub const APP_SIZE_LIMIT: usize = 0x20000;
+ pub const CLOCK_FREQ: usize = 12500000;
+ /// the physical memory end
+ pub const MEMORY_END: usize = 0x88000000;
++
++/// max number of syscall ids for tracing
++pub const MAX_SYSCALL_NUM: usize = 500;
+diff --git a/os/src/syscall/mod.rs b/os/src/syscall/mod.rs
+index 3b579ba..ef3b574 100644
+--- a/os/src/syscall/mod.rs
++++ b/os/src/syscall/mod.rs
+@@ -27,8 +27,11 @@ mod process;
+ use fs::*;
+ use process::*;
+ 
++use crate::task::inc_syscall_count;
++
+ /// handle syscall exception with `syscall_id` and other arguments
+ pub fn syscall(syscall_id: usize, args: [usize; 3]) -> isize {
++    inc_syscall_count(syscall_id);
+     match syscall_id {
+         SYSCALL_WRITE => sys_write(args[0], args[1] as *const u8, args[2]),
+         SYSCALL_EXIT => sys_exit(args[0] as i32),
+diff --git a/os/src/syscall/process.rs b/os/src/syscall/process.rs
+index ab43bbe..8d48df0 100644
+--- a/os/src/syscall/process.rs
++++ b/os/src/syscall/process.rs
+@@ -1,13 +1,17 @@
+ //! Process management syscalls
+ use crate::{
+-    task::{exit_current_and_run_next, suspend_current_and_run_next},
++    config::MEMORY_END,
++    task::{exit_current_and_run_next, get_syscall_count, suspend_current_and_run_next},
+     timer::get_time_us,
+ };
+ 
+ #[repr(C)]
+ #[derive(Debug)]
++/// TimeVal struct for sys_get_time
+ pub struct TimeVal {
++    /// seconds
+     pub sec: usize,
++    /// microseconds
+     pub usec: usize,
+ }
+ 
+@@ -38,8 +42,38 @@ pub fn sys_get_time(ts: *mut TimeVal, _tz: usize) -> isize {
+     0
+ }
+ 
+-// TODO: implement the syscall
+-pub fn sys_trace(_trace_request: usize, _id: usize, _data: usize) -> isize {
+-    trace!("kernel: sys_trace");
+-    -1
++/// Check whether an address is valid in ch3 (no virtual memory, shared physical space).
++fn is_valid_user_addr(addr: usize) -> bool {
++    addr != 0 && addr < MEMORY_END
++}
++
++/// Trace syscall: read/write user memory or count syscall invocations.
++///
++/// - `trace_request = 0` (Read): read one byte from user address `id`
++/// - `trace_request = 1` (Write): write `data as u8` to user address `id`
++/// - `trace_request = 2` (Syscall): return the count of syscall `id` for current task
++pub fn sys_trace(trace_request: usize, id: usize, data: usize) -> isize {
++    match trace_request {
++        // Read
++        0 => {
++            if !is_valid_user_addr(id) {
++                return -1;
++            }
++            let byte = unsafe { *(id as *const u8) };
++            byte as isize
++        }
++        // Write
++        1 => {
++            if !is_valid_user_addr(id) {
++                return -1;
++            }
++            unsafe {
++                *(id as *mut u8) = data as u8;
++            }
++            0
++        }
++        // Syscall count
++        2 => get_syscall_count(id) as isize,
++        _ => -1,
++    }
+ }
+diff --git a/os/src/task/mod.rs b/os/src/task/mod.rs
+index c1636ef..f9395b3 100644
+--- a/os/src/task/mod.rs
++++ b/os/src/task/mod.rs
+@@ -14,7 +14,7 @@ mod switch;
+ #[allow(clippy::module_inception)]
+ mod task;
+ 
+-use crate::config::MAX_APP_NUM;
++use crate::config::{MAX_APP_NUM, MAX_SYSCALL_NUM};
+ use crate::loader::{get_num_app, init_app_cx};
+ use crate::sync::UPSafeCell;
+ use lazy_static::*;
+@@ -54,6 +54,7 @@ lazy_static! {
+         let mut tasks = [TaskControlBlock {
+             task_cx: TaskContext::zero_init(),
+             task_status: TaskStatus::UnInit,
++            syscall_counts: [0; MAX_SYSCALL_NUM],
+         }; MAX_APP_NUM];
+         for (i, task) in tasks.iter_mut().enumerate() {
+             task.task_cx = TaskContext::goto_restore(init_app_cx(i));
+@@ -137,6 +138,26 @@ impl TaskManager {
+     }
+ }
+ 
++/// Increment the syscall count for the current task.
++pub fn inc_syscall_count(syscall_id: usize) {
++    let mut inner = TASK_MANAGER.inner.exclusive_access();
++    let current = inner.current_task;
++    if syscall_id < MAX_SYSCALL_NUM {
++        inner.tasks[current].syscall_counts[syscall_id] += 1;
++    }
++}
++
++/// Get the syscall count for the current task.
++pub fn get_syscall_count(syscall_id: usize) -> u32 {
++    let inner = TASK_MANAGER.inner.exclusive_access();
++    let current = inner.current_task;
++    if syscall_id < MAX_SYSCALL_NUM {
++        inner.tasks[current].syscall_counts[syscall_id]
++    } else {
++        0
++    }
++}
++
+ /// Run the first task in task list.
+ pub fn run_first_task() {
+     TASK_MANAGER.run_first_task();
+diff --git a/os/src/task/task.rs b/os/src/task/task.rs
+index e6580c9..974dd14 100644
+--- a/os/src/task/task.rs
++++ b/os/src/task/task.rs
+@@ -1,6 +1,7 @@
+ //! Types related to task management
+ 
+ use super::TaskContext;
++use crate::config::MAX_SYSCALL_NUM;
+ 
+ /// The task control block (TCB) of a task.
+ #[derive(Copy, Clone)]
+@@ -9,6 +10,8 @@ pub struct TaskControlBlock {
+     pub task_status: TaskStatus,
+     /// The task context
+     pub task_cx: TaskContext,
++    /// Syscall invocation counts for this task
++    pub syscall_counts: [u32; MAX_SYSCALL_NUM],
+ }
+ 
+ /// The status of a task

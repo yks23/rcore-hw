@@ -1,0 +1,427 @@
+diff --git a/os/src/mm/memory_set.rs b/os/src/mm/memory_set.rs
+index c3d15f3..1a8e5e9 100644
+--- a/os/src/mm/memory_set.rs
++++ b/os/src/mm/memory_set.rs
+@@ -271,6 +271,48 @@ impl MemorySet {
+         self.areas.clear();
+     }
+ 
++    /// Map a new framed area [start_va, end_va). Returns 0 on success, -1 on failure.
++    pub fn mmap(&mut self, start_va: VirtAddr, end_va: VirtAddr, permission: MapPermission) -> isize {
++        let start_vpn = start_va.floor();
++        let end_vpn = end_va.ceil();
++        for vpn in VPNRange::new(start_vpn, end_vpn) {
++            if let Some(pte) = self.page_table.translate(vpn) {
++                if pte.is_valid() {
++                    return -1;
++                }
++            }
++        }
++        self.insert_framed_area(start_va, end_va, permission);
++        0
++    }
++
++    /// Unmap the area covering [start_va, end_va). Returns 0 on success, -1 on failure.
++    pub fn munmap(&mut self, start_va: VirtAddr, end_va: VirtAddr) -> isize {
++        let start_vpn = start_va.floor();
++        let end_vpn = end_va.ceil();
++        for vpn in VPNRange::new(start_vpn, end_vpn) {
++            match self.page_table.translate(vpn) {
++                Some(pte) if pte.is_valid() => {}
++                _ => return -1,
++            }
++        }
++        if let Some(idx) = self.areas.iter().position(|area| {
++            area.vpn_range.get_start() == start_vpn && area.vpn_range.get_end() == end_vpn
++        }) {
++            self.areas[idx].unmap(&mut self.page_table);
++            self.areas.remove(idx);
++            0
++        } else {
++            for vpn in VPNRange::new(start_vpn, end_vpn) {
++                self.page_table.unmap(vpn);
++            }
++            self.areas.retain(|area| {
++                !(area.vpn_range.get_start() >= start_vpn && area.vpn_range.get_end() <= end_vpn)
++            });
++            0
++        }
++    }
++
+     /// shrink the area to new_end
+     #[allow(unused)]
+     pub fn shrink_to(&mut self, start: VirtAddr, new_end: VirtAddr) -> bool {
+diff --git a/os/src/syscall/process.rs b/os/src/syscall/process.rs
+index 1631f39..ec40ba7 100644
+--- a/os/src/syscall/process.rs
++++ b/os/src/syscall/process.rs
+@@ -2,18 +2,23 @@
+ use alloc::sync::Arc;
+ 
+ use crate::{
++    config::PAGE_SIZE,
+     loader::get_app_data_by_name,
+-    mm::{translated_refmut, translated_str},
++    mm::{translated_byte_buffer, translated_refmut, translated_str, MapPermission, VirtAddr},
+     task::{
+         add_task, current_task, current_user_token, exit_current_and_run_next,
+         suspend_current_and_run_next,
+     },
++    timer::get_time_us,
+ };
+ 
+ #[repr(C)]
+ #[derive(Debug)]
++/// TimeVal struct for sys_get_time
+ pub struct TimeVal {
++    /// seconds
+     pub sec: usize,
++    /// microseconds
+     pub usec: usize,
+ }
+ 
+@@ -31,26 +36,25 @@ pub fn sys_yield() -> isize {
+     0
+ }
+ 
++/// get pid of current process
+ pub fn sys_getpid() -> isize {
+     trace!("kernel: sys_getpid pid:{}", current_task().unwrap().pid.0);
+     current_task().unwrap().pid.0 as isize
+ }
+ 
++/// fork current process
+ pub fn sys_fork() -> isize {
+     trace!("kernel:pid[{}] sys_fork", current_task().unwrap().pid.0);
+     let current_task = current_task().unwrap();
+     let new_task = current_task.fork();
+     let new_pid = new_task.pid.0;
+-    // modify trap context of new_task, because it returns immediately after switching
+     let trap_cx = new_task.inner_exclusive_access().get_trap_cx();
+-    // we do not have to move to next instruction since we have done it before
+-    // for child process, fork returns 0
+     trap_cx.x[10] = 0;
+-    // add new task to scheduler
+     add_task(new_task);
+     new_pid as isize
+ }
+ 
++/// exec a new program
+ pub fn sys_exec(path: *const u8) -> isize {
+     trace!("kernel:pid[{}] sys_exec", current_task().unwrap().pid.0);
+     let token = current_user_token();
+@@ -67,11 +71,12 @@ pub fn sys_exec(path: *const u8) -> isize {
+ /// If there is not a child process whose pid is same as given, return -1.
+ /// Else if there is a child process but it is still running, return -2.
+ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
+-    trace!("kernel::pid[{}] sys_waitpid [{}]", current_task().unwrap().pid.0, pid);
++    trace!(
++        "kernel::pid[{}] sys_waitpid [{}]",
++        current_task().unwrap().pid.0,
++        pid
++    );
+     let task = current_task().unwrap();
+-    // find a child process
+-
+-    // ---- access current PCB exclusively
+     let mut inner = task.inner_exclusive_access();
+     if !inner
+         .children
+@@ -79,56 +84,83 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
+         .any(|p| pid == -1 || pid as usize == p.getpid())
+     {
+         return -1;
+-        // ---- release current PCB
+     }
+     let pair = inner.children.iter().enumerate().find(|(_, p)| {
+-        // ++++ temporarily access child PCB exclusively
+         p.inner_exclusive_access().is_zombie() && (pid == -1 || pid as usize == p.getpid())
+-        // ++++ release child PCB
+     });
+     if let Some((idx, _)) = pair {
+         let child = inner.children.remove(idx);
+-        // confirm that child will be deallocated after being removed from children list
+         assert_eq!(Arc::strong_count(&child), 1);
+         let found_pid = child.getpid();
+-        // ++++ temporarily access child PCB exclusively
+         let exit_code = child.inner_exclusive_access().exit_code;
+-        // ++++ release child PCB
+         *translated_refmut(inner.memory_set.token(), exit_code_ptr) = exit_code;
+         found_pid as isize
+     } else {
+         -2
+     }
+-    // ---- release current PCB automatically
+ }
+ 
+-/// YOUR JOB: get time with second and microsecond
+-/// HINT: You might reimplement it with virtual memory management.
+-/// HINT: What if [`TimeVal`] is splitted by two pages ?
+-pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
+-    trace!(
+-        "kernel:pid[{}] sys_get_time NOT IMPLEMENTED",
+-        current_task().unwrap().pid.0
+-    );
+-    -1
++/// get time with second and microsecond (virtual memory aware)
++pub fn sys_get_time(ts: *mut TimeVal, _tz: usize) -> isize {
++    let us = get_time_us();
++    let token = current_user_token();
++    let buffers = translated_byte_buffer(token, ts as *const u8, core::mem::size_of::<TimeVal>());
++    let time_val = TimeVal {
++        sec: us / 1_000_000,
++        usec: us % 1_000_000,
++    };
++    let src = unsafe {
++        core::slice::from_raw_parts(
++            &time_val as *const TimeVal as *const u8,
++            core::mem::size_of::<TimeVal>(),
++        )
++    };
++    let mut offset = 0;
++    for buf in buffers {
++        let copy_len = buf.len();
++        buf.copy_from_slice(&src[offset..offset + copy_len]);
++        offset += copy_len;
++    }
++    0
+ }
+ 
+-/// YOUR JOB: Implement mmap.
+-pub fn sys_mmap(_start: usize, _len: usize, _port: usize) -> isize {
+-    trace!(
+-        "kernel:pid[{}] sys_mmap NOT IMPLEMENTED",
+-        current_task().unwrap().pid.0
+-    );
+-    -1
++/// Implement mmap.
++pub fn sys_mmap(start: usize, len: usize, port: usize) -> isize {
++    if start % PAGE_SIZE != 0 || len == 0 {
++        return -1;
++    }
++    if port & !0x7 != 0 || port == 0 {
++        return -1;
++    }
++    let mut perm = MapPermission::U;
++    if port & 1 != 0 {
++        perm |= MapPermission::R;
++    }
++    if port & 2 != 0 {
++        perm |= MapPermission::W;
++    }
++    if port & 4 != 0 {
++        perm |= MapPermission::X;
++    }
++    let aligned_len = (len + PAGE_SIZE - 1) / PAGE_SIZE * PAGE_SIZE;
++    let task = current_task().unwrap();
++    let mut inner = task.inner_exclusive_access();
++    let start_va = VirtAddr::from(start);
++    let end_va = VirtAddr::from(start + aligned_len);
++    inner.memory_set.mmap(start_va, end_va, perm)
+ }
+ 
+-/// YOUR JOB: Implement munmap.
+-pub fn sys_munmap(_start: usize, _len: usize) -> isize {
+-    trace!(
+-        "kernel:pid[{}] sys_munmap NOT IMPLEMENTED",
+-        current_task().unwrap().pid.0
+-    );
+-    -1
++/// Implement munmap.
++pub fn sys_munmap(start: usize, len: usize) -> isize {
++    if start % PAGE_SIZE != 0 || len == 0 {
++        return -1;
++    }
++    let aligned_len = (len + PAGE_SIZE - 1) / PAGE_SIZE * PAGE_SIZE;
++    let task = current_task().unwrap();
++    let mut inner = task.inner_exclusive_access();
++    let start_va = VirtAddr::from(start);
++    let end_va = VirtAddr::from(start + aligned_len);
++    inner.memory_set.munmap(start_va, end_va)
+ }
+ 
+ /// change data segment size
+@@ -141,21 +173,28 @@ pub fn sys_sbrk(size: i32) -> isize {
+     }
+ }
+ 
+-/// YOUR JOB: Implement spawn.
+-/// HINT: fork + exec =/= spawn
+-pub fn sys_spawn(_path: *const u8) -> isize {
+-    trace!(
+-        "kernel:pid[{}] sys_spawn NOT IMPLEMENTED",
+-        current_task().unwrap().pid.0
+-    );
+-    -1
++/// Spawn a new process from a path.
++pub fn sys_spawn(path: *const u8) -> isize {
++    let token = current_user_token();
++    let path = translated_str(token, path);
++    if let Some(data) = get_app_data_by_name(path.as_str()) {
++        let task = current_task().unwrap();
++        let new_task = task.spawn(data);
++        let new_pid = new_task.pid.0;
++        add_task(new_task);
++        new_pid as isize
++    } else {
++        -1
++    }
+ }
+ 
+-// YOUR JOB: Set task priority.
+-pub fn sys_set_priority(_prio: isize) -> isize {
+-    trace!(
+-        "kernel:pid[{}] sys_set_priority NOT IMPLEMENTED",
+-        current_task().unwrap().pid.0
+-    );
+-    -1
++/// Set task priority. prio must be >= 2.
++pub fn sys_set_priority(prio: isize) -> isize {
++    if prio < 2 {
++        return -1;
++    }
++    let task = current_task().unwrap();
++    let mut inner = task.inner_exclusive_access();
++    inner.priority = prio;
++    prio
+ }
+diff --git a/os/src/task/manager.rs b/os/src/task/manager.rs
+index 99393a4..41e97a3 100644
+--- a/os/src/task/manager.rs
++++ b/os/src/task/manager.rs
+@@ -4,12 +4,16 @@ use crate::sync::UPSafeCell;
+ use alloc::collections::VecDeque;
+ use alloc::sync::Arc;
+ use lazy_static::*;
++
++/// Big stride constant for stride scheduling
++const BIG_STRIDE: usize = 0x10000;
++
+ ///A array of `TaskControlBlock` that is thread-safe
+ pub struct TaskManager {
+     ready_queue: VecDeque<Arc<TaskControlBlock>>,
+ }
+ 
+-/// A simple FIFO scheduler.
++/// Stride scheduler implementation.
+ impl TaskManager {
+     ///Creat an empty TaskManager
+     pub fn new() -> Self {
+@@ -21,9 +25,29 @@ impl TaskManager {
+     pub fn add(&mut self, task: Arc<TaskControlBlock>) {
+         self.ready_queue.push_back(task);
+     }
+-    /// Take a process out of the ready queue
++    /// Take the process with the minimum stride from the ready queue (stride scheduling)
+     pub fn fetch(&mut self) -> Option<Arc<TaskControlBlock>> {
+-        self.ready_queue.pop_front()
++        if self.ready_queue.is_empty() {
++            return None;
++        }
++        let mut min_idx = 0;
++        let mut min_stride = usize::MAX;
++        for (i, task) in self.ready_queue.iter().enumerate() {
++            let inner = task.inner_exclusive_access();
++            let s = inner.stride;
++            drop(inner);
++            if s < min_stride {
++                min_stride = s;
++                min_idx = i;
++            }
++        }
++        let task = self.ready_queue.remove(min_idx).unwrap();
++        {
++            let mut inner = task.inner_exclusive_access();
++            let prio = inner.priority.max(2) as usize;
++            inner.stride += BIG_STRIDE / prio;
++        }
++        Some(task)
+     }
+ }
+ 
+diff --git a/os/src/task/task.rs b/os/src/task/task.rs
+index 1402c31..3846ced 100644
+--- a/os/src/task/task.rs
++++ b/os/src/task/task.rs
+@@ -68,6 +68,12 @@ pub struct TaskControlBlockInner {
+ 
+     /// Program break
+     pub program_brk: usize,
++
++    /// Task priority for stride scheduling (>= 2, default 16)
++    pub priority: isize,
++
++    /// Stride scheduling: accumulated pass value
++    pub stride: usize,
+ }
+ 
+ impl TaskControlBlockInner {
+@@ -118,6 +124,8 @@ impl TaskControlBlock {
+                     exit_code: 0,
+                     heap_bottom: user_sp,
+                     program_brk: user_sp,
++                    priority: 16,
++                    stride: 0,
+                 })
+             },
+         };
+@@ -133,6 +141,50 @@ impl TaskControlBlock {
+         task_control_block
+     }
+ 
++    /// Spawn a new process from elf data, set current process as parent
++    pub fn spawn(self: &Arc<Self>, elf_data: &[u8]) -> Arc<Self> {
++        let (memory_set, user_sp, entry_point) = MemorySet::from_elf(elf_data);
++        let trap_cx_ppn = memory_set
++            .translate(VirtAddr::from(TRAP_CONTEXT_BASE).into())
++            .unwrap()
++            .ppn();
++        let pid_handle = pid_alloc();
++        let kernel_stack = kstack_alloc();
++        let kernel_stack_top = kernel_stack.get_top();
++        let task_control_block = Arc::new(TaskControlBlock {
++            pid: pid_handle,
++            kernel_stack,
++            inner: unsafe {
++                UPSafeCell::new(TaskControlBlockInner {
++                    trap_cx_ppn,
++                    base_size: user_sp,
++                    task_cx: TaskContext::goto_trap_return(kernel_stack_top),
++                    task_status: TaskStatus::Ready,
++                    memory_set,
++                    parent: Some(Arc::downgrade(self)),
++                    children: Vec::new(),
++                    exit_code: 0,
++                    heap_bottom: user_sp,
++                    program_brk: user_sp,
++                    priority: 16,
++                    stride: 0,
++                })
++            },
++        });
++        let trap_cx = task_control_block.inner_exclusive_access().get_trap_cx();
++        *trap_cx = TrapContext::app_init_context(
++            entry_point,
++            user_sp,
++            KERNEL_SPACE.exclusive_access().token(),
++            kernel_stack_top,
++            trap_handler as usize,
++        );
++        let mut parent_inner = self.inner_exclusive_access();
++        parent_inner.children.push(task_control_block.clone());
++        drop(parent_inner);
++        task_control_block
++    }
++
+     /// Load a new elf to replace the original application address space and start execution
+     pub fn exec(&self, elf_data: &[u8]) {
+         // memory_set with elf program headers/trampoline/trap context/user stack
+@@ -191,6 +243,8 @@ impl TaskControlBlock {
+                     exit_code: 0,
+                     heap_bottom: parent_inner.heap_bottom,
+                     program_brk: parent_inner.program_brk,
++                    priority: 16,
++                    stride: 0,
+                 })
+             },
+         });
