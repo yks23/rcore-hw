@@ -45,9 +45,19 @@ make run               # runs in QEMU (use timeout to avoid hanging on shutdown)
 
 The OS will boot, run user programs, print results, and then repeatedly panic with "It should shutdown!" — this is expected behavior in ch3 because the SBI shutdown call doesn't cleanly exit QEMU 8.x. Use `timeout 20 make run` to avoid infinite hang.
 
+For ch8, the full `ch8_usertest` suite runs 22 tests in parallel. Some benchmark tests (phil_din_mutex, condvar) take 5+ minutes. To verify deadlock detection quickly, run individual tests:
+
+```bash
+echo "ch8_deadlock_mutex1" | timeout 30 make run-inner   # mutex self-deadlock
+echo "ch8_deadlock_sem1"   | timeout 30 make run-inner   # semaphore cycle deadlock
+echo "ch8_deadlock_sem2"   | timeout 30 make run-inner   # no false positive
+```
+
+**Do NOT** add `check_timer_no_trace()` to the idle loop or `timer.rs` — this causes boot failures on QEMU 8.x.
+
 ### Lint
 
-- `cd /workspace/code/os && cargo fmt -- --check` — passes on the OS kernel
+- `cd /workspace/code/os && cargo fmt -- --check` — passes on the OS kernel (pre-existing diff in `task/manager.rs`)
 - `cd /workspace/code/os && cargo clippy --target riscv64gc-unknown-none-elf` — has a pre-existing `missing_safety_doc` error due to `#![deny(warnings)]`
 - `cd /workspace/code/user && cargo fmt -- --check` — has pre-existing formatting diffs in the test suite
 
